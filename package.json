@@ -1,9 +1,17 @@
 {
   "name": "realtime-video-translator",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Chrome MV3 extension prototype for realtime AI video subtitles and translation.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/forestai123456/realtime-video-translator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/forestai123456/realtime-video-translator/issues"
+  },
+  "homepage": "https://github.com/forestai123456/realtime-video-translator#readme",
   "scripts": {
     "build": "node scripts/build.mjs",
     "dev:server": "node scripts/realtime-translation-server.mjs",

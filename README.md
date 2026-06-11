@@ -2,6 +2,15 @@
 
 Chrome MV3 extension prototype for low-latency AI video subtitles and translation.
 
+## Repository Status
+
+This repository contains the full source code for development. It does not commit generated build output or local secrets.
+
+- Source code lives in `src/`.
+- The local realtime ASR/translation backend lives in `scripts/realtime-translation-server.mjs`.
+- Browser extension build output is generated into `dist/` by `npm run build`.
+- Runtime secrets belong in a local `.env` file. Use `.env.example` as the template.
+
 This project is intentionally focused on the video subtitle path first:
 
 - Injects a subtitle overlay into every webpage.
@@ -19,6 +28,8 @@ npm run build
 ```
 
 The unpacked extension is generated in `dist/`.
+
+`dist/` is intentionally ignored by Git. For now, clone the repository and build locally before loading the extension. A downloadable packaged release can be added later when the project is ready for public users.
 
 ## Load in Chrome or Edge
 
@@ -153,11 +164,19 @@ The UI ignores interim updates. Send display-ready `isFinal: true` fragments to 
 
 ## Source Layout
 
+- `src/manifest.json`: Chrome MV3 extension manifest.
 - `src/background.ts`: popup commands, settings, offscreen lifecycle, `tabCapture.getMediaStreamId()`.
-- `src/offscreen/offscreen.ts`: tab audio stream, AudioWorklet, WebSocket streaming, mock caption mode.
-- `src/offscreen/audioWorkletProcessor.js`: downsampling and PCM frame generation.
-- `src/content/contentScript.ts`: page subtitle overlay.
-- `src/popup/*`: extension popup controls.
+- `src/offscreen/`: tab audio capture, AudioWorklet, WebSocket streaming, mock caption mode.
+- `src/content/`: subtitle overlay, page translation, video pause/resume handling.
+- `src/popup/`: extension popup controls.
+- `src/pdf/`: PDF translation result page.
+- `scripts/build.mjs`: esbuild-based extension bundler.
+- `scripts/realtime-translation-server.mjs`: local Volcengine/Doubao ASR and translation backend.
+- `test-fixtures/`: local manual test page and media fixtures.
+
+## License
+
+MIT
 
 ## FluentRead Reference
 
