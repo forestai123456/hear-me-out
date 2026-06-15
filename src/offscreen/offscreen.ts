@@ -1,4 +1,4 @@
-import { CaptionUpdate, RuntimeMessage, TranslatorSettings } from "../types";
+import type { CaptionUpdate, RuntimeMessage, TranslatorSettings } from "../types";
 
 interface Session {
   tabId: number;
@@ -14,12 +14,13 @@ interface Session {
   healthTimer?: number;
   lastAudioFrameAt?: number;
   stopping?: boolean;
+  paused?: boolean;
   startedAt: number;
 }
 
 const sessions = new Map<number, Session>();
-const SILENCE_RMS_THRESHOLD = 25;
 const SESSION_HEALTH_CHECK_MS = 2_000;
+const MAX_SOCKET_BUFFERED_BYTES = 768 * 1024;
 
 chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResponse) => {
   if (message.type === "offscreen:start") {
@@ -31,6 +32,53 @@ chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResp
 
   if (message.type === "offscreen:stop") {
     void stopSession(message.tabId);
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "offscreen:pause") {
+    const session = sessions.get(message.tabId);
+    if (session && !session.stopping) {
+      session.paused = true;
+      if (session.mockTimer) {
+        window.clearInterval(session.mockTimer);
+        delete session.mockTimer;
+      }
+      if (session.socket?.readyState === WebSocket.OPEN) {
+        try {
+          session.socket.send(JSON.stringify({ type: "session.stop" }));
+        } catch {}
+      }
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "offscreen:resume") {
+    const session = sessions.get(message.tabId);
+    if (session && !session.stopping) {
+      session.paused = false;
+      session.lastAudioFrameAt = Date.now();
+      if (session.mode === "mock") {
+        startMockSession(session);
+      } else {
+        const socket = ensureSocket(session);
+        if (socket.readyState === WebSocket.OPEN) {
+          try {
+            socket.send(
+              JSON.stringify({
+                type: "session.start",
+                targetLanguage: session.settings.targetLanguage,
+                sampleRate: 16000,
+                format: "pcm16",
+                asr: session.settings.asr,
+                translation: session.settings.translation,
+              }),
+            );
+          } catch {}
+        }
+      }
+    }
     sendResponse({ ok: true });
     return false;
   }
@@ -60,7 +108,7 @@ async function startSession(tabId: number, settings: TranslatorSettings, streamI
     return;
   }
 
-  throw new Error("No backendUrl configured and mock mode is disabled.");
+  throw new Error("本机翻译服务未配置，且模拟字幕已关闭。");
 }
 
 async function startWebSocketSession(session: Session): Promise<void> {
@@ -79,12 +127,11 @@ async function startWebSocketSession(session: Session): Promise<void> {
   });
 
   worklet.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
-    if (!sessions.has(session.tabId) || session.stopping) return;
-    if (!isAudiblePcmFrame(event.data)) return;
+    if (!sessions.has(session.tabId) || session.stopping || session.paused) return;
     session.lastAudioFrameAt = Date.now();
 
     const socket = ensureSocket(session);
-    if (socket.readyState === WebSocket.OPEN) {
+    if (socket.readyState === WebSocket.OPEN && socket.bufferedAmount < MAX_SOCKET_BUFFERED_BYTES) {
       socket.send(event.data);
     }
   };
@@ -109,11 +156,17 @@ function startSessionHealthCheck(session: Session): void {
       void session.audioContext.resume().catch(() => undefined);
     }
 
+    if (session.paused) return;
+
     const trackLive = session.stream?.getAudioTracks().some((track) => track.readyState === "live") ?? false;
     if (!trackLive) return;
 
     if (!session.socket || session.socket.readyState === WebSocket.CLOSED || session.socket.readyState === WebSocket.CLOSING) {
       ensureSocket(session);
+    }
+
+    if (session.socket?.readyState === WebSocket.OPEN && session.socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
+      session.socket.close();
     }
   }, SESSION_HEALTH_CHECK_MS);
 }
@@ -131,7 +184,7 @@ function ensureSocket(session: Session): WebSocket {
   session.socket = socket;
 
   socket.addEventListener("open", () => {
-    if (session.stopping || session.socket !== socket) {
+    if (session.stopping || session.paused || session.socket !== socket) {
       socket.close();
       return;
     }
@@ -142,6 +195,8 @@ function ensureSocket(session: Session): WebSocket {
         targetLanguage: session.settings.targetLanguage,
         sampleRate: 16000,
         format: "pcm16",
+        asr: session.settings.asr,
+        translation: session.settings.translation,
       }),
     );
   });
@@ -159,8 +214,8 @@ function ensureSocket(session: Session): WebSocket {
     if (session.stopping) return;
     void publishCaption(session.tabId, {
       id: `error-${Date.now()}`,
-      sourceText: "后端连接失败。",
-      translatedText: "后端连接失败，请检查 WebSocket 地址。恢复播放后会自动重连。",
+      sourceText: "本机服务连接失败。",
+      translatedText: "本机服务连接失败，请确认本机翻译服务已启动。恢复播放后会自动重连。",
       isFinal: true,
       startedAt: session.startedAt,
       receivedAt: Date.now(),
@@ -172,11 +227,16 @@ function ensureSocket(session: Session): WebSocket {
 }
 
 function startMockSession(session: Session): void {
+  if (session.mockTimer) {
+    window.clearInterval(session.mockTimer);
+    delete session.mockTimer;
+  }
+
   const script: Array<[string, string]> = [
     ["The browser is capturing this tab audio in realtime.", "浏览器正在实时采集当前标签页音频。"],
     ["Interim captions appear first and can be replaced quickly.", "临时字幕会先出现，并且可以快速被修正。"],
     ["Final captions lock after a short pause in speech.", "说话短暂停顿后，字幕会变成确认结果。"],
-    ["Connect a streaming ASR backend to replace this mock feed.", "接入流式语音识别后端后，就能替换这条模拟流。"],
+    ["Connect a streaming speech service to replace this demo feed.", "接入流式语音识别服务后，就能替换这条模拟流。"],
   ];
 
   let index = 0;
@@ -231,18 +291,6 @@ async function stopSession(tabId: number): Promise<void> {
   session.stream?.getTracks().forEach((track) => track.stop());
   await session.audioContext?.close().catch(() => undefined);
   sessions.delete(tabId);
-}
-
-function isAudiblePcmFrame(data: ArrayBuffer): boolean {
-  const samples = new Int16Array(data);
-  if (samples.length === 0) return false;
-
-  let sumSquares = 0;
-  for (const sample of samples) {
-    sumSquares += sample * sample;
-  }
-
-  return Math.sqrt(sumSquares / samples.length) >= SILENCE_RMS_THRESHOLD;
 }
 
 function parseBackendCaption(data: unknown): CaptionUpdate | null {

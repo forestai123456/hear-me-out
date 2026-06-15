@@ -1,12 +1,15 @@
-import { CaptionUpdate, RuntimeMessage, RuntimeResponse, StreamMode } from "../types";
+import type { CaptionUpdate, PageTranslateProgress, RuntimeMessage, RuntimeResponse, StreamMode, SubtitleStyle, TranslatorSettings } from "../types";
 
 const ROOT_ID = "rvt-subtitle-root";
+const SELECTION_ROOT_ID = "rvt-selection-translation-root";
 const NATIVE_CUE_STYLE_ID = "rvt-native-cue-style";
 const PAGE_TRANSLATION_BATCH_SIZE = 20;
 const PAGE_TRANSLATION_CONCURRENCY = 4;
 const PAGE_TRANSLATION_MAX_NODES = 1_500;
 const PAGE_TRANSLATION_MAX_NODE_CHARS = 1_800;
-const STABLE_CAPTION_MAX_CHARS = 22;
+const DYNAMIC_PAGE_TRANSLATION_DELAY_MS = 800;
+const TRANSLATED_NODE_HISTORY_LIMIT = 8_000;
+const STABLE_CAPTION_MAX_CHARS = 24;
 const STABLE_CAPTION_MIN_CHARS = 6;
 const STABLE_CAPTION_FAST_COMMIT_MS = 650;
 const STABLE_CAPTION_FALLBACK_COMMIT_MS = 2_400;
@@ -15,12 +18,23 @@ const VIDEO_RESUME_GRACE_MS = 2_800;
 const VIDEO_RESUME_RESTART_THROTTLE_MS = 8_000;
 const VIDEO_RESUME_FORCE_RESTART_THROTTLE_MS = 1_500;
 const VIDEO_RESUME_FORCE_RESTART_DELAY_MS = 350;
+const SELECTION_TRANSLATION_MAX_CHARS = 1_200;
 
 type RvtWindow = Window & {
   __rvtContentScriptCleanup?: () => void;
 };
 
+type CommittedCaption = {
+  sourceText: string;
+  translatedText: string;
+  translationLines: string[];
+};
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _unused_CommittedCaption = 0;
+
 const rvtWindow = window as RvtWindow;
+const IS_TOP_FRAME = window.top === window;
 try {
   rvtWindow.__rvtContentScriptCleanup?.();
 } catch {
@@ -28,14 +42,22 @@ try {
 }
 
 document.getElementById(ROOT_ID)?.remove();
+document.getElementById(SELECTION_ROOT_ID)?.remove();
 
 let host: HTMLElement | null = null;
 let root: HTMLElement | null = null;
 let statusEl: HTMLElement | null = null;
 let sourceEl: HTMLElement | null = null;
 let translationEl: HTMLElement | null = null;
+let selectionHost: HTMLElement | null = null;
+let selectionRoot: HTMLElement | null = null;
+let selectionPreviewEl: HTMLElement | null = null;
+let selectionResultEl: HTMLElement | null = null;
+let selectionButton: HTMLButtonElement | null = null;
+let selectionCloseButton: HTMLButtonElement | null = null;
 let positionTimer: number | null = null;
 let captionExpiryTimer: number | null = null;
+let selectionCheckTimer: number | null = null;
 let translatedTextNodes: Array<{ node: Text; original: string }> = [];
 let nativeCaptionTrack: TextTrack | null = null;
 let nativeCaptionVideo: HTMLVideoElement | null = null;
@@ -49,10 +71,18 @@ let pendingStableCaption: { caption: CaptionUpdate; allowFragment: boolean } | n
 let stableCaptionTimer: number | null = null;
 let autoPageTranslationEnabled = false;
 let autoPageTranslationTargetLanguage = "zh-CN";
+let selectionTranslationEnabled = true;
+let selectionTranslationTargetLanguage = "zh-CN";
+let subtitleStyle: SubtitleStyle = "bold";
+let showOriginal = false;
+let showTranslation = true;
 let autoPageTranslationTimer: number | null = null;
+let autoTriggeredTranslateRunning = false;
+let pageTranslationObserver: MutationObserver | null = null;
 let observedPageUrl = location.href;
 let activePageTranslationRunId = 0;
 let autoPageTranslationWatchersInstalled = false;
+let selectionTranslationWatchersInstalled = false;
 let videoResumeWatchdogInstalled = false;
 let videoResumeTimer: number | null = null;
 let lastVideoResumeRestartAt = 0;
@@ -64,10 +94,13 @@ let videoResumeInFlight = false;
 let extensionContextInvalidated = false;
 let originalPushState: History["pushState"] | null = null;
 let originalReplaceState: History["replaceState"] | null = null;
+let selectedTextForTranslation = "";
+let selectionTranslationRequestId = 0;
 
 rvtWindow.__rvtContentScriptCleanup = cleanupContentScript;
 void initAutoPageTranslation();
-installVideoResumeWatchdog();
+if (IS_TOP_FRAME) installSelectionTranslationWatchers();
+if (IS_TOP_FRAME) installVideoResumeWatchdog();
 window.addEventListener("unhandledrejection", handleUnhandledRejection);
 
 if (isExtensionRuntimeAvailable()) {
@@ -77,14 +110,15 @@ if (isExtensionRuntimeAvailable()) {
 function handleRuntimeMessage(message: RuntimeMessage, _sender: chrome.runtime.MessageSender, sendResponse: (response?: unknown) => void): boolean {
   if (!isExtensionRuntimeAvailable()) return false;
   if (message.type === "caption:update") {
-    renderCaption(message.caption);
+    if (IS_TOP_FRAME) renderCaption(message.caption);
   }
 
   if (message.type === "caption:clear") {
-    clearCaptionDisplay();
+    if (IS_TOP_FRAME) clearCaptionDisplay();
   }
 
   if (message.type === "caption:state") {
+    if (!IS_TOP_FRAME) return false;
     if (message.running) {
       ensureOverlay();
       setStatus(true, message.mode);
@@ -95,10 +129,31 @@ function handleRuntimeMessage(message: RuntimeMessage, _sender: chrome.runtime.M
   }
 
   if (message.type === "page:translate") {
-    translatePage(message.targetLanguage ?? "zh-CN")
-      .then((translated) => sendResponse({ ok: true, translated }))
-      .catch((error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }));
-    return true;
+    const runId = ++activePageTranslationRunId;
+    sendResponse({ ok: true, translated: 0, inProgress: true, runId });
+    void translatePage(message.targetLanguage ?? "zh-CN")
+      .then((translated) => {
+        if (runId !== activePageTranslationRunId) return;
+        void chrome.runtime
+          .sendMessage({
+            type: "page:translate:done",
+            runId,
+            translated,
+          } satisfies RuntimeMessage)
+          .catch(() => undefined);
+      })
+      .catch((error: unknown) => {
+        if (runId !== activePageTranslationRunId) return;
+        void chrome.runtime
+          .sendMessage({
+            type: "page:translate:done",
+            runId,
+            translated: 0,
+            error: error instanceof Error ? error.message : String(error),
+          } satisfies RuntimeMessage)
+          .catch(() => undefined);
+      });
+    return false;
   }
 
   if (message.type === "page:restore") {
@@ -115,7 +170,7 @@ async function initAutoPageTranslation(): Promise<void> {
   const response = await sendRuntimeMessageSafe<RuntimeResponse>({ type: "translator:settings:get" } satisfies RuntimeMessage);
   if (!response?.ok || !response.settings) return;
 
-  updateAutoPageTranslationState(response.settings.autoTranslatePages, response.settings.targetLanguage);
+  updateSettingsState(response.settings);
 }
 
 function installAutoPageTranslationWatchers(): void {
@@ -146,12 +201,40 @@ function installAutoPageTranslationWatchers(): void {
 
 function handleStorageChanged(changes: { [key: string]: chrome.storage.StorageChange }, areaName: string): void {
   if (!isExtensionRuntimeAvailable()) return;
-  if (areaName !== "sync" || !changes.settings?.newValue) return;
-  const settings = changes.settings.newValue as {
-    autoTranslatePages?: boolean;
-    targetLanguage?: string;
-  };
+  if ((areaName !== "local" && areaName !== "sync") || !changes.settings?.newValue) return;
+  updateSettingsState(changes.settings.newValue as Partial<TranslatorSettings>);
+}
+
+function updateSettingsState(settings: Partial<TranslatorSettings>): void {
   updateAutoPageTranslationState(Boolean(settings.autoTranslatePages), settings.targetLanguage ?? "zh-CN");
+  updateSelectionTranslationState(settings.selectionTranslationEnabled !== false, settings.targetLanguage ?? "zh-CN");
+  updateSubtitleStyle(settings.subtitleStyle);
+  updateSubtitleDisplayMode(settings);
+}
+
+function updateSelectionTranslationState(enabled: boolean, targetLanguage: string): void {
+  selectionTranslationEnabled = enabled;
+  selectionTranslationTargetLanguage = targetLanguage || "zh-CN";
+
+  if (enabled) {
+    installSelectionTranslationWatchers();
+    scheduleSelectionTranslatorCheck(120);
+    return;
+  }
+
+  hideSelectionTranslator();
+}
+
+function updateSubtitleStyle(nextStyle?: SubtitleStyle): void {
+  subtitleStyle = nextStyle ?? "bold";
+  if (root) root.dataset.style = subtitleStyle;
+}
+
+function updateSubtitleDisplayMode(settings: Partial<TranslatorSettings>): void {
+  showOriginal = Boolean(settings.showOriginal);
+  showTranslation = settings.showTranslation !== false;
+  if (root) root.dataset.mode = showOriginal && showTranslation ? "bilingual" : "translation";
+  renderCommittedCaptionLines();
 }
 
 function handleAutoPageShow(): void {
@@ -163,10 +246,12 @@ function updateAutoPageTranslationState(enabled: boolean, targetLanguage: string
   autoPageTranslationTargetLanguage = targetLanguage || "zh-CN";
 
   if (enabled) {
+    startPageTranslationObserver();
     scheduleAutoPageTranslation(700);
     return;
   }
 
+  stopPageTranslationObserver();
   if (autoPageTranslationTimer !== null) {
     window.clearTimeout(autoPageTranslationTimer);
     autoPageTranslationTimer = null;
@@ -191,8 +276,315 @@ function scheduleAutoPageTranslation(delayMs: number): void {
   autoPageTranslationTimer = window.setTimeout(() => {
     autoPageTranslationTimer = null;
     if (!autoPageTranslationEnabled) return;
-    void translatePage(autoPageTranslationTargetLanguage).catch(() => undefined);
+    autoTriggeredTranslateRunning = true;
+    void translatePage(autoPageTranslationTargetLanguage)
+      .catch(() => undefined)
+      .finally(() => {
+        autoTriggeredTranslateRunning = false;
+      });
   }, delayMs);
+}
+
+function startPageTranslationObserver(): void {
+  if (pageTranslationObserver || !document.body) return;
+  pageTranslationObserver = new MutationObserver((mutations) => {
+    if (!autoPageTranslationEnabled || pageTranslationObserverSuspended) {
+      pageTranslationObserver?.takeRecords();
+      return;
+    }
+    if (!mutations.some(containsNewTranslatableText)) return;
+    scheduleAutoPageTranslation(DYNAMIC_PAGE_TRANSLATION_DELAY_MS);
+  });
+  pageTranslationObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+}
+
+function stopPageTranslationObserver(): void {
+  pageTranslationObserver?.disconnect();
+  pageTranslationObserver = null;
+}
+
+let pageTranslationObserverSuspended = false;
+
+function pausePageTranslationObserver(): void {
+  if (!pageTranslationObserver) return;
+  pageTranslationObserverSuspended = true;
+  pageTranslationObserver.takeRecords();
+}
+
+function resumePageTranslationObserver(): void {
+  pageTranslationObserverSuspended = false;
+}
+
+function containsNewTranslatableText(mutation: MutationRecord): boolean {
+  if (mutation.type === "characterData") {
+    return isTranslatableTextNode(mutation.target);
+  }
+
+  for (const node of mutation.addedNodes) {
+    if (isTranslatableTextNode(node)) return true;
+    if (node instanceof Element && elementContainsTranslatableText(node)) return true;
+  }
+
+  return false;
+}
+
+function elementContainsTranslatableText(element: Element): boolean {
+  if (shouldSkipTranslationElement(element)) return false;
+  const text = (element.textContent ?? "").trim();
+  return text.length > 1;
+}
+
+function isTranslatableTextNode(node: Node): boolean {
+  if (node.nodeType !== Node.TEXT_NODE) return false;
+  const text = node.nodeValue ?? "";
+  if (text.trim().length < 2) return false;
+  const parent = node.parentElement;
+  return Boolean(parent && !shouldSkipTranslationElement(parent));
+}
+
+function installSelectionTranslationWatchers(): void {
+  if (selectionTranslationWatchersInstalled) return;
+  if (!isExtensionRuntimeAvailable()) return;
+  selectionTranslationWatchersInstalled = true;
+
+  document.addEventListener("selectionchange", handleSelectionChange);
+  document.addEventListener("mouseup", handleSelectionGestureComplete, true);
+  document.addEventListener("keyup", handleSelectionGestureComplete, true);
+  document.addEventListener("mousedown", handleSelectionOutsideMouseDown, true);
+  window.addEventListener("scroll", handleSelectionViewportChanged, true);
+  window.addEventListener("resize", handleSelectionViewportChanged);
+}
+
+function handleSelectionChange(): void {
+  scheduleSelectionTranslatorCheck(120);
+}
+
+function handleSelectionGestureComplete(event: Event): void {
+  if (!selectionTranslationEnabled) return;
+  if (isSelectionTranslatorEvent(event)) return;
+  scheduleSelectionTranslatorCheck(70);
+}
+
+function handleSelectionOutsideMouseDown(event: MouseEvent): void {
+  if (!selectionHost || selectionHost.dataset.visible !== "true") return;
+  if (isSelectionTranslatorEvent(event)) return;
+  hideSelectionTranslator();
+}
+
+function handleSelectionViewportChanged(): void {
+  if (!selectionHost || selectionHost.dataset.visible !== "true") return;
+  const info = getCurrentSelectionInfo();
+  if (!info || info.text !== selectedTextForTranslation) {
+    hideSelectionTranslator();
+    return;
+  }
+  positionSelectionTranslator(info.rect);
+}
+
+function scheduleSelectionTranslatorCheck(delayMs: number): void {
+  if (!selectionTranslationEnabled || !isExtensionRuntimeAvailable()) return;
+  if (selectionCheckTimer !== null) window.clearTimeout(selectionCheckTimer);
+  selectionCheckTimer = window.setTimeout(() => {
+    selectionCheckTimer = null;
+    showTranslatorForCurrentSelection();
+  }, delayMs);
+}
+
+function showTranslatorForCurrentSelection(): void {
+  if (!selectionTranslationEnabled || !isExtensionRuntimeAvailable()) {
+    hideSelectionTranslator();
+    return;
+  }
+
+  const info = getCurrentSelectionInfo();
+  if (!info) {
+    hideSelectionTranslator();
+    return;
+  }
+
+  ensureSelectionTranslator();
+  if (!selectionHost || !selectionRoot || !selectionPreviewEl || !selectionResultEl || !selectionButton) return;
+
+  selectedTextForTranslation = info.text;
+  selectionTranslationRequestId += 1;
+  selectionPreviewEl.textContent = compactSelectionPreview(info.text);
+  selectionResultEl.textContent = "";
+  selectionRoot.dataset.state = "ready";
+  selectionHost.dataset.visible = "true";
+  selectionButton.disabled = false;
+  selectionButton.textContent = "翻译";
+  positionSelectionTranslator(info.rect);
+}
+
+function getCurrentSelectionInfo(): { text: string; rect: DOMRect } | null {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+
+  const text = normalizeSelectionText(selection.toString());
+  if (!text || text.length > SELECTION_TRANSLATION_MAX_CHARS) return null;
+
+  const range = selection.getRangeAt(0);
+  const container = getSelectionContainerElement(range);
+  if (!container || shouldSkipSelectionElement(container)) return null;
+
+  const rect = getSelectionRangeRect(range);
+  if (!rect) return null;
+
+  return { text, rect };
+}
+
+function normalizeSelectionText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function compactSelectionPreview(text: string): string {
+  const normalized = normalizeSelectionText(text);
+  if (normalized.length <= 80) return normalized;
+  return `${normalized.slice(0, 78)}...`;
+}
+
+function getSelectionContainerElement(range: Range): Element | null {
+  const container = range.commonAncestorContainer;
+  if (container instanceof Element) return container;
+  return container.parentElement;
+}
+
+function getSelectionRangeRect(range: Range): DOMRect | null {
+  const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+  if (rects.length > 0) return rects[rects.length - 1] ?? null;
+
+  const rect = range.getBoundingClientRect();
+  if (rect.width > 0 && rect.height > 0) return rect;
+  return null;
+}
+
+function shouldSkipSelectionElement(element: Element): boolean {
+  if (element.closest(`#${ROOT_ID}, #${SELECTION_ROOT_ID}`)) return true;
+  return shouldSkipTranslationElement(element);
+}
+
+function ensureSelectionTranslator(): void {
+  if (selectionHost && document.documentElement.contains(selectionHost)) return;
+
+  selectionHost = document.createElement("div");
+  selectionHost.id = SELECTION_ROOT_ID;
+  selectionHost.dataset.visible = "false";
+  const shadow = selectionHost.attachShadow({ mode: "open" });
+
+  const style = document.createElement("style");
+  style.textContent = SELECTION_TRANSLATOR_STYLE;
+
+  selectionRoot = document.createElement("section");
+  selectionRoot.className = "rvt-selection-panel";
+  selectionRoot.dataset.state = "ready";
+
+  const header = document.createElement("div");
+  header.className = "rvt-selection-header";
+
+  selectionButton = document.createElement("button");
+  selectionButton.type = "button";
+  selectionButton.className = "rvt-selection-action";
+  selectionButton.textContent = "翻译";
+  selectionButton.addEventListener("mousedown", (event) => event.preventDefault());
+  selectionButton.addEventListener("click", () => {
+    void translateSelectedText();
+  });
+
+  selectionCloseButton = document.createElement("button");
+  selectionCloseButton.type = "button";
+  selectionCloseButton.className = "rvt-selection-close";
+  selectionCloseButton.textContent = "×";
+  selectionCloseButton.title = "关闭";
+  selectionCloseButton.addEventListener("mousedown", (event) => event.preventDefault());
+  selectionCloseButton.addEventListener("click", hideSelectionTranslator);
+
+  header.append(selectionButton, selectionCloseButton);
+
+  selectionPreviewEl = document.createElement("p");
+  selectionPreviewEl.className = "rvt-selection-source";
+
+  selectionResultEl = document.createElement("p");
+  selectionResultEl.className = "rvt-selection-result";
+
+  selectionRoot.append(header, selectionPreviewEl, selectionResultEl);
+  shadow.append(style, selectionRoot);
+  document.documentElement.append(selectionHost);
+}
+
+function positionSelectionTranslator(rect: DOMRect): void {
+  if (!selectionHost) return;
+  const margin = 12;
+  const left = Math.min(Math.max(rect.left + rect.width / 2, margin), window.innerWidth - margin);
+  const shouldPlaceAbove = rect.bottom + 160 > window.innerHeight && rect.top > 160;
+  const top = shouldPlaceAbove ? Math.max(margin, rect.top - 8) : Math.min(window.innerHeight - margin, rect.bottom + 8);
+
+  selectionHost.dataset.placement = shouldPlaceAbove ? "top" : "bottom";
+  selectionHost.style.setProperty("--rvt-selection-left", `${left}px`);
+  selectionHost.style.setProperty("--rvt-selection-top", `${top}px`);
+}
+
+async function translateSelectedText(): Promise<void> {
+  if (!selectedTextForTranslation || !selectionRoot || !selectionResultEl || !selectionButton) return;
+  const requestId = ++selectionTranslationRequestId;
+  const text = selectedTextForTranslation;
+
+  selectionRoot.dataset.state = "loading";
+  selectionButton.disabled = true;
+  selectionButton.textContent = "翻译中";
+  selectionResultEl.textContent = "正在翻译...";
+
+  try {
+    const response = await sendRuntimeMessageSafe<RuntimeResponse>({
+      type: "page:translate:batch",
+      texts: [text],
+      targetLanguage: selectionTranslationTargetLanguage,
+    } satisfies RuntimeMessage);
+    if (requestId !== selectionTranslationRequestId) return;
+
+    if (!response?.ok) {
+      selectionRoot.dataset.state = "error";
+      selectionResultEl.textContent = response?.error ?? "划词翻译失败，请检查后端。";
+      return;
+    }
+
+    selectionRoot.dataset.state = "done";
+    selectionResultEl.textContent = response.translations?.[0]?.trim() || "没有返回译文。";
+  } catch (error) {
+    if (requestId !== selectionTranslationRequestId) return;
+    selectionRoot.dataset.state = "error";
+    selectionResultEl.textContent = error instanceof Error ? error.message : "划词翻译失败。";
+  } finally {
+    if (requestId === selectionTranslationRequestId && selectionButton) {
+      selectionButton.disabled = false;
+      selectionButton.textContent = "重试";
+    }
+  }
+}
+
+function hideSelectionTranslator(): void {
+  if (selectionCheckTimer !== null) {
+    window.clearTimeout(selectionCheckTimer);
+    selectionCheckTimer = null;
+  }
+  selectedTextForTranslation = "";
+  selectionTranslationRequestId += 1;
+  if (selectionHost) selectionHost.dataset.visible = "false";
+  if (selectionRoot) selectionRoot.dataset.state = "ready";
+  if (selectionPreviewEl) selectionPreviewEl.textContent = "";
+  if (selectionResultEl) selectionResultEl.textContent = "";
+  if (selectionButton) {
+    selectionButton.disabled = false;
+    selectionButton.textContent = "翻译";
+  }
+}
+
+function isSelectionTranslatorEvent(event: Event): boolean {
+  if (!selectionHost) return false;
+  return event.composedPath().includes(selectionHost);
 }
 
 function renderCaption(caption: CaptionUpdate): void {
@@ -285,9 +677,17 @@ async function resumeTranslatorAfterVideoPause(): Promise<void> {
 
   try {
     videoPauseObserved = false;
-    translatorSuspendedByVideoPause = false;
-    lastVideoResumeRestartAt = Date.now();
-    await sendRuntimeMessageSafe<RuntimeResponse>({ type: "translator:resume" } satisfies RuntimeMessage);
+    const response = await sendRuntimeMessageSafe<RuntimeResponse>({ type: "translator:resume" } satisfies RuntimeMessage);
+    if (response?.ok && response.running) {
+      translatorSuspendedByVideoPause = false;
+      lastVideoResumeRestartAt = Date.now();
+      scheduleVideoResumeHealthCheck(false);
+      return;
+    }
+
+    translatorSuspendedByVideoPause = true;
+    lastVideoResumeRestartAt = 0;
+    scheduleVideoResumeHealthCheck(true);
   } finally {
     videoResumeInFlight = false;
   }
@@ -345,6 +745,8 @@ function ensureOverlay(): void {
   root = document.createElement("section");
   root.className = "rvt-subtitle-panel";
   root.dataset.phase = "idle";
+  root.dataset.style = subtitleStyle;
+  root.dataset.mode = showOriginal && showTranslation ? "bilingual" : "translation";
 
   const header = document.createElement("div");
   header.className = "rvt-subtitle-header";
@@ -493,8 +895,8 @@ function updateOverlayPosition(): void {
   const safeGap = Math.max(18, Math.min(54, rect.height * 0.08));
   const bottom = Math.max(16, viewportHeight - Math.min(rect.bottom, viewportHeight) + safeGap);
   const left = Math.min(Math.max(rect.left + rect.width / 2, 16), viewportWidth - 16);
-  const widthLimit = document.fullscreenElement ? viewportWidth * 0.7 : Math.min(viewportWidth * 0.7, 920);
-  const width = Math.min(widthLimit, Math.max(320, Math.min(rect.width * 0.7, viewportWidth - 32)));
+  const widthLimit = document.fullscreenElement ? viewportWidth * 0.86 : Math.min(viewportWidth * 0.82, 1080);
+  const width = Math.min(widthLimit, Math.max(360, Math.min(rect.width * 0.82, viewportWidth - 24)));
 
   host.style.setProperty("--rvt-left", `${left}px`);
   host.style.setProperty("--rvt-bottom", `${bottom}px`);
@@ -568,9 +970,9 @@ function isSameCaptionEvolution(previousSource: string, currentSource: string): 
   const current = normalizeCaptionForCompare(currentSource);
   if (!previous || !current) return false;
   if (previous === current) return true;
-  const shorterLength = Math.min(previous.length, current.length);
-  if (!current.includes(previous) && !previous.includes(current)) return false;
-  return shorterLength >= 12;
+  if (current.includes(previous)) return false;
+  if (!previous.includes(current)) return false;
+  return current.length >= 12;
 }
 
 function normalizeCaptionForCompare(text: string): string {
@@ -657,6 +1059,8 @@ function renderCommittedCaptionLines(caption = lastCaption): void {
   if (host) host.dataset.visible = display.sourceText || display.translatedText ? "true" : "false";
   sourceEl.textContent = display.sourceText;
   translationEl.textContent = display.translatedText;
+  sourceEl.toggleAttribute("hidden", !display.sourceText);
+  translationEl.toggleAttribute("hidden", !display.translatedText);
   root.dataset.phase = "final";
 
   if (caption && (display.sourceText || display.translatedText)) {
@@ -667,7 +1071,9 @@ function renderCommittedCaptionLines(caption = lastCaption): void {
 
 function getCommittedDisplayCaption(): Pick<CaptionUpdate, "sourceText" | "translatedText"> {
   if (committedCaptionLines.length === 0) return { sourceText: "", translatedText: "" };
-  if (committedCaptionLines.length === 1) return { sourceText: "", translatedText: committedCaptionLines[0] ?? "" };
+  if (committedCaptionLines.length === 1) {
+    return { sourceText: "", translatedText: committedCaptionLines[0] ?? "" };
+  }
   return {
     sourceText: committedCaptionLines[committedCaptionLines.length - 2] ?? "",
     translatedText: committedCaptionLines[committedCaptionLines.length - 1] ?? "",
@@ -751,7 +1157,17 @@ function splitSubtitleDisplayLines(text: string, maxChars: number): string[] {
   }
 
   if (current) lines.push(current);
-  return mergeShortSubtitleTails(lines, maxChars).filter(isMeaningfulSubtitleLine);
+  return mergeShortSubtitleTails(lines, maxChars)
+    .map(normalizeSubtitleDisplayLine)
+    .filter(isMeaningfulSubtitleLine);
+}
+
+function normalizeSubtitleDisplayLine(text: string): string {
+  return text
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[。.]+([）)\]】」』”"']*)$/u, "$1")
+    .trim();
 }
 
 function splitLongSubtitleLine(text: string, maxChars: number): string[] {
@@ -838,6 +1254,12 @@ function markExtensionContextInvalidated(): void {
     window.clearTimeout(autoPageTranslationTimer);
     autoPageTranslationTimer = null;
   }
+  if (selectionCheckTimer !== null) {
+    window.clearTimeout(selectionCheckTimer);
+    selectionCheckTimer = null;
+  }
+  hideSelectionTranslator();
+  stopPageTranslationObserver();
   removeDomEventListeners();
 }
 
@@ -852,10 +1274,22 @@ function cleanupContentScript(): void {
     window.clearTimeout(autoPageTranslationTimer);
     autoPageTranslationTimer = null;
   }
+  if (selectionCheckTimer !== null) {
+    window.clearTimeout(selectionCheckTimer);
+    selectionCheckTimer = null;
+  }
+  stopPageTranslationObserver();
   if (positionTimer !== null) {
     window.clearInterval(positionTimer);
     positionTimer = null;
   }
+  selectionHost?.remove();
+  selectionHost = null;
+  selectionRoot = null;
+  selectionPreviewEl = null;
+  selectionResultEl = null;
+  selectionButton = null;
+  selectionCloseButton = null;
 
   removeDomEventListeners();
   window.removeEventListener("unhandledrejection", handleUnhandledRejection);
@@ -889,8 +1323,15 @@ function removeDomEventListeners(): void {
   window.removeEventListener("popstate", handlePageUrlMaybeChanged);
   window.removeEventListener("hashchange", handlePageUrlMaybeChanged);
   window.removeEventListener("pageshow", handleAutoPageShow);
+  document.removeEventListener("selectionchange", handleSelectionChange);
+  document.removeEventListener("mouseup", handleSelectionGestureComplete, true);
+  document.removeEventListener("keyup", handleSelectionGestureComplete, true);
+  document.removeEventListener("mousedown", handleSelectionOutsideMouseDown, true);
+  window.removeEventListener("scroll", handleSelectionViewportChanged, true);
+  window.removeEventListener("resize", handleSelectionViewportChanged);
   videoResumeWatchdogInstalled = false;
   autoPageTranslationWatchersInstalled = false;
+  selectionTranslationWatchersInstalled = false;
 }
 
 function isExtensionContextInvalidated(error: unknown): boolean {
@@ -951,25 +1392,96 @@ function clearTextTrack(track: TextTrack): void {
   }
 }
 
-async function translatePage(targetLanguage: string): Promise<number> {
-  const runId = ++activePageTranslationRunId;
-  restorePage();
-  const candidates = collectTranslatableTextNodes();
-  if (candidates.length === 0) return 0;
-
-  const batches: Array<typeof candidates> = [];
-  for (let index = 0; index < candidates.length; index += PAGE_TRANSLATION_BATCH_SIZE) {
-    batches.push(candidates.slice(index, index + PAGE_TRANSLATION_BATCH_SIZE));
+/**
+ * Reorder candidates so nodes that share a parent element stay adjacent,
+ * then return a single flat array. The TreeWalker already visits the DOM
+ * roughly in document order, so siblings are usually consecutive anyway —
+ * this just guarantees it. Downstream we slice the flat list into fixed-size
+ * translation batches, which keeps sibling context inside each batch
+ * without spawning one API call per parent element.
+ */
+function groupCandidatesByParentFlat(
+  candidates: ReturnType<typeof collectTranslatableTextNodes>,
+): ReturnType<typeof collectTranslatableTextNodes> {
+  // The walker yields nodes in document order; siblings sharing a parent
+  // are already adjacent. Stable sort by parent keeps that property while
+  // being a no-op in the common case, so batches never split a paragraph
+  // across two API requests unless the paragraph itself overflows a batch.
+  const byParent = new Map<Element, ReturnType<typeof collectTranslatableTextNodes>>();
+  for (const item of candidates) {
+    const parent = item.node.parentElement;
+    if (!parent) continue;
+    const bucket = byParent.get(parent);
+    if (bucket) bucket.push(item);
+    else byParent.set(parent, [item]);
   }
 
+  // Re-emit in the original first-seen order of each parent so the page
+  // still translates top-to-bottom, which also matches how the user reads.
+  const seenParents: Element[] = [];
+  const seen = new Set<Element>();
+  for (const item of candidates) {
+    const parent = item.node.parentElement;
+    if (parent && !seen.has(parent)) {
+      seen.add(parent);
+      seenParents.push(parent);
+    }
+  }
+
+  const flat: ReturnType<typeof collectTranslatableTextNodes> = [];
+  for (const parent of seenParents) {
+    const bucket = byParent.get(parent);
+    if (bucket) flat.push(...bucket);
+  }
+  return flat;
+}
+
+async function translatePage(targetLanguage: string): Promise<number> {
+  const runId = ++activePageTranslationRunId;
+  pruneTranslatedTextNodes();
+  let candidates = collectTranslatableTextNodes();
+
+  // Don't restore page for auto-triggered re-translations — that would
+  // flash the page back to original text before re-translating.
+  if (candidates.length === 0 && translatedTextNodes.length > 0) {
+    if (autoTriggeredTranslateRunning) return 0;
+    restorePage();
+    candidates = collectTranslatableTextNodes();
+  }
+  if (candidates.length === 0) return 0;
+
+  // Keep nodes that share a parent together so each batch still carries
+  // sibling context for the model, then slice the ordered list into
+  // fixed-size batches. This collapses "one API call per parent element"
+  // (which could be hundreds of round-trips) into a small number of big
+  // batches — the single biggest reason page translation used to be slow.
+  const ordered = groupCandidatesByParentFlat(candidates);
+  const batches: Array<ReturnType<typeof collectTranslatableTextNodes>> = [];
+  for (let index = 0; index < ordered.length; index += PAGE_TRANSLATION_BATCH_SIZE) {
+    batches.push(ordered.slice(index, index + PAGE_TRANSLATION_BATCH_SIZE));
+  }
+  const totalBatches = batches.length;
+  let completedBatches = 0;
   let nextBatchIndex = 0;
+
   await Promise.all(
     Array.from({ length: Math.min(PAGE_TRANSLATION_CONCURRENCY, batches.length) }, async () => {
       while (nextBatchIndex < batches.length) {
         const batch = batches[nextBatchIndex];
         nextBatchIndex += 1;
-        if (!batch) continue;
+        if (!batch || batch.length === 0) continue;
         await translatePageBatch(batch, targetLanguage, runId);
+        completedBatches += 1;
+        void chrome.runtime
+          .sendMessage({
+            type: "page:translate:progress",
+            runId,
+            translated: translatedTextNodes.length,
+            total: candidates.length,
+            batchIndex: completedBatches,
+            totalBatches,
+          } satisfies PageTranslateProgress)
+          .catch(() => undefined);
       }
     }),
   );
@@ -982,32 +1494,54 @@ async function translatePageBatch(
   targetLanguage: string,
   runId: number,
 ): Promise<void> {
+  const texts = batch.map((item) => item.trimmed);
+
   const response = await sendRuntimeMessageSafe<RuntimeResponse>({
     type: "page:translate:batch",
-    texts: batch.map((item) => item.trimmed),
+    texts,
     targetLanguage,
   } satisfies RuntimeMessage);
 
   if (!response?.ok) throw new Error(response?.error ?? "网页翻译失败。");
   const translations = response.translations ?? [];
 
-    batch.forEach((item, itemIndex) => {
-      if (runId !== activePageTranslationRunId) return;
-      const translated = translations[itemIndex];
-      if (!translated) return;
-      if (item.node.nodeValue !== item.original) return;
-      translatedTextNodes.push({ node: item.node, original: item.original });
-      item.node.nodeValue = `${item.leading}${translated}${item.trailing}`;
-    });
+  batch.forEach((item, itemIndex) => {
+    if (runId !== activePageTranslationRunId) return;
+    const translated = translations[itemIndex];
+    if (item.node.nodeValue !== item.original) return;
+    if (isTranslatedTextNode(item.node)) return;
+    const finalText = translated || item.trimmed;
+    if (!finalText.trim()) return;
+    translatedTextNodes.push({ node: item.node, original: item.original });
+    if (translatedTextNodes.length > TRANSLATED_NODE_HISTORY_LIMIT) {
+      translatedTextNodes = translatedTextNodes.slice(-TRANSLATED_NODE_HISTORY_LIMIT);
+    }
+    pausePageTranslationObserver();
+    try {
+      item.node.nodeValue = `${item.leading}${finalText}${item.trailing}`;
+    } finally {
+      resumePageTranslationObserver();
+    }
+  });
 }
 
 function restorePage(): number {
   const restored = translatedTextNodes.length;
-  for (const item of translatedTextNodes) {
-    if (document.documentElement.contains(item.node)) item.node.nodeValue = item.original;
+  pausePageTranslationObserver();
+  try {
+    for (const item of translatedTextNodes) {
+      if (document.documentElement.contains(item.node)) item.node.nodeValue = item.original;
+    }
+  } finally {
+    resumePageTranslationObserver();
   }
   translatedTextNodes = [];
+  clearSkipElementCache();
   return restored;
+}
+
+function pruneTranslatedTextNodes(): void {
+  translatedTextNodes = translatedTextNodes.filter((item) => document.documentElement.contains(item.node));
 }
 
 function collectTranslatableTextNodes(): Array<{
@@ -1027,7 +1561,6 @@ function collectTranslatableTextNodes(): Array<{
 
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      if (nodes.length >= PAGE_TRANSLATION_MAX_NODES) return NodeFilter.FILTER_REJECT;
       const text = node.nodeValue ?? "";
       const trimmed = text.trim();
       if (trimmed.length < 2 || !/[A-Za-z]/.test(trimmed)) return NodeFilter.FILTER_REJECT;
@@ -1035,7 +1568,7 @@ function collectTranslatableTextNodes(): Array<{
 
       const parent = node.parentElement;
       if (!parent || shouldSkipTranslationElement(parent)) return NodeFilter.FILTER_REJECT;
-      if (!isElementVisibleInTree(parent)) return NodeFilter.FILTER_REJECT;
+      if (isTranslatedTextNode(node as Text)) return NodeFilter.FILTER_REJECT;
 
       return NodeFilter.FILTER_ACCEPT;
     },
@@ -1059,25 +1592,145 @@ function collectTranslatableTextNodes(): Array<{
   return nodes;
 }
 
+function isTranslatedTextNode(node: Text): boolean {
+  return translatedTextNodes.some((item) => item.node === node);
+}
+
+const skipElementCache = new WeakMap<Element, boolean>();
+
 function shouldSkipTranslationElement(element: Element): boolean {
-  if (element.closest(`#${ROOT_ID}`)) return true;
-  if (element.closest("script, style, noscript, textarea, input, select, option, code, pre, kbd, samp, svg, canvas, iframe")) return true;
-  if (element.closest("[contenteditable='true'], [contenteditable='']")) return true;
-  if (element.closest("[aria-hidden='true'], [hidden]")) return true;
+  const cached = skipElementCache.get(element);
+  if (cached !== undefined) return cached;
+
+  if (element.closest(`#${ROOT_ID}, #${SELECTION_ROOT_ID}`)) { skipElementCache.set(element, true); return true; }
+  if (element.closest("script, style, noscript, textarea, input, select, option, code, pre, kbd, samp, svg, canvas, iframe")) { skipElementCache.set(element, true); return true; }
+  if (element.closest("[contenteditable='true'], [contenteditable='']")) { skipElementCache.set(element, true); return true; }
+  if (element.closest("[aria-hidden='true'], [hidden]")) { skipElementCache.set(element, true); return true; }
+  const style = window.getComputedStyle(element);
+  if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") { skipElementCache.set(element, true); return true; }
+  if (element.getClientRects().length === 0) { skipElementCache.set(element, true); return true; }
+  skipElementCache.set(element, false);
   return false;
 }
 
-function isElementVisibleInTree(element: HTMLElement): boolean {
-  let current: HTMLElement | null = element;
-  while (current && current !== document.body) {
-    const style = window.getComputedStyle(current);
-    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-    current = current.parentElement;
+function clearSkipElementCache(): void {
+  (skipElementCache as unknown as { clear?: () => void }).clear?.();
+}
+
+const SELECTION_TRANSLATOR_STYLE = `
+  :host {
+    position: fixed !important;
+    left: var(--rvt-selection-left, 50%) !important;
+    top: var(--rvt-selection-top, 0) !important;
+    z-index: 2147483647 !important;
+    width: min(360px, calc(100vw - 24px)) !important;
+    transform: translateX(-50%) !important;
+    pointer-events: none !important;
+    opacity: 0 !important;
+    transition:
+      opacity 120ms ease,
+      transform 120ms ease !important;
   }
 
-  const rects = element.getClientRects();
-  return rects.length > 0;
-}
+  :host([data-visible="true"]) {
+    opacity: 1 !important;
+  }
+
+  :host([data-placement="top"]) {
+    transform: translateX(-50%) translateY(-100%) !important;
+  }
+
+  .rvt-selection-panel {
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    width: 100%;
+    max-height: min(320px, calc(100vh - 24px));
+    overflow: auto;
+    padding: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.98);
+    color: #111827;
+    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.22);
+    font-family:
+      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    pointer-events: auto;
+  }
+
+  .rvt-selection-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .rvt-selection-action,
+  .rvt-selection-close {
+    appearance: none;
+    border: 0;
+    border-radius: 6px;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .rvt-selection-action {
+    min-height: 28px;
+    padding: 0 12px;
+    background: #111827;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 750;
+  }
+
+  .rvt-selection-action:disabled {
+    cursor: default;
+    opacity: 0.72;
+  }
+
+  .rvt-selection-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    background: #f3f4f6;
+    color: #4b5563;
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  .rvt-selection-source,
+  .rvt-selection-result {
+    margin: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    line-height: 1.45;
+  }
+
+  .rvt-selection-source {
+    color: #6b7280;
+    font-size: 12px;
+  }
+
+  .rvt-selection-result {
+    color: #111827;
+    font-size: 14px;
+    font-weight: 650;
+  }
+
+  .rvt-selection-panel[data-state="ready"] .rvt-selection-result:empty {
+    display: none;
+  }
+
+  .rvt-selection-panel[data-state="loading"] .rvt-selection-result {
+    color: #2563eb;
+  }
+
+  .rvt-selection-panel[data-state="error"] .rvt-selection-result {
+    color: #dc2626;
+  }
+`;
 
 const SUBTITLE_STYLE = `
   :host {
@@ -1085,7 +1738,7 @@ const SUBTITLE_STYLE = `
     left: var(--rvt-left, 50%) !important;
     bottom: var(--rvt-bottom, 7vh) !important;
     z-index: 2147483647 !important;
-    width: var(--rvt-width, min(760px, calc(100vw - 32px))) !important;
+    width: var(--rvt-width, min(900px, calc(100vw - 24px))) !important;
     transform: translateX(-50%) !important;
     box-sizing: border-box !important;
     pointer-events: none !important;
@@ -1141,6 +1794,7 @@ const SUBTITLE_STYLE = `
   .rvt-subtitle-translation {
     margin: 0;
     overflow-wrap: anywhere;
+    white-space: pre-line;
     text-align: center;
     display: -webkit-box;
     -webkit-box-orient: vertical;
@@ -1160,7 +1814,7 @@ const SUBTITLE_STYLE = `
 
   .rvt-subtitle-translation {
     color: #ffffff;
-    font-size: clamp(21px, 2.15vw, 36px);
+    font-size: clamp(22px, 1.9vw, 32px);
     font-weight: 750;
     line-height: 1.22;
     text-shadow:
@@ -1169,8 +1823,58 @@ const SUBTITLE_STYLE = `
     -webkit-line-clamp: 2;
   }
 
+  .rvt-subtitle-source[hidden],
+  .rvt-subtitle-translation[hidden] {
+    display: none !important;
+  }
+
+  .rvt-subtitle-panel[data-mode="bilingual"] .rvt-subtitle-body {
+    gap: 4px;
+  }
+
+  .rvt-subtitle-panel[data-mode="bilingual"] .rvt-subtitle-source {
+    color: rgba(229, 231, 235, 0.9);
+    font-size: clamp(16px, 1.45vw, 24px);
+    font-weight: 620;
+  }
+
+  .rvt-subtitle-panel[data-mode="bilingual"] .rvt-subtitle-translation {
+    font-size: clamp(20px, 1.72vw, 30px);
+    -webkit-line-clamp: 2;
+  }
+
   .rvt-subtitle-panel[data-phase="interim"] .rvt-subtitle-translation {
     color: #dbeafe;
+  }
+
+  .rvt-subtitle-panel[data-style="normal"] .rvt-subtitle-source {
+    font-weight: 560;
+    text-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.72),
+      0 0 4px rgba(0, 0, 0, 0.48);
+  }
+
+  .rvt-subtitle-panel[data-style="normal"] .rvt-subtitle-translation {
+    font-size: clamp(20px, 1.72vw, 30px);
+    font-weight: 650;
+    text-shadow:
+      0 2px 2px rgba(0, 0, 0, 0.78),
+      0 0 6px rgba(0, 0, 0, 0.54);
+  }
+
+  .rvt-subtitle-panel[data-style="soft"] .rvt-subtitle-source {
+    color: rgba(241, 245, 249, 0.82);
+    font-weight: 520;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+  }
+
+  .rvt-subtitle-panel[data-style="soft"] .rvt-subtitle-translation {
+    color: rgba(255, 255, 255, 0.92);
+    font-size: clamp(19px, 1.62vw, 28px);
+    font-weight: 600;
+    text-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.72),
+      0 0 5px rgba(0, 0, 0, 0.5);
   }
 
   @media (max-width: 640px) {
@@ -1189,4 +1893,4 @@ const SUBTITLE_STYLE = `
   }
 `;
 
-ensureOverlay();
+if (IS_TOP_FRAME) ensureOverlay();

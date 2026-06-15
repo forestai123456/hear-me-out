@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -13,53 +13,178 @@
         <span id="status" class="status">已停止</span>
       </header>
 
-      <section class="panel">
-        <div class="panel-title">
-          <h2>视频字幕</h2>
+      <section class="settings" aria-label="常用设置">
+        <div class="setting-row">
+          <label for="subtitleToggle">视频实时翻译</label>
+          <label class="switch">
+            <input id="subtitleToggle" type="checkbox" />
+            <span></span>
+          </label>
         </div>
-        <div class="controls">
-          <button id="start" type="button">开始字幕</button>
-          <button id="stop" type="button" class="secondary">停止</button>
+
+        <div class="setting-row">
+          <label for="translationMode">翻译模式</label>
+          <select id="translationMode">
+            <option value="translation">只看译文</option>
+            <option value="bilingual">双语对照模式</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="subtitleStyle">译文样式</label>
+          <select id="subtitleStyle">
+            <option value="bold">加粗显示</option>
+            <option value="normal">常规显示</option>
+            <option value="soft">柔和显示</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="asrProvider">语音服务</label>
+          <select id="asrProvider">
+            <option value="volcengine">火山引擎 / 豆包 2.0</option>
+            <option value="aliyun">阿里云百炼 / Qwen-ASR</option>
+            <option value="tencent">腾讯云 ASR</option>
+            <option value="baidu">百度智能云 ASR</option>
+            <option value="iflytek">科大讯飞转写</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="translationProvider">翻译服务</label>
+          <select id="translationProvider">
+            <option value="microsoft">微软免费翻译</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="mimo">小米 MiMo</option>
+            <option value="kimi">Kimi</option>
+            <option value="glm">GLM / 智谱</option>
+            <option value="qwen">Qwen / 通义千问</option>
+            <option value="minimax">MiniMax</option>
+            <option value="custom">自定义模型</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="targetLanguage">目标语言</label>
+          <select id="targetLanguage">
+            <option value="zh-CN">中文</option>
+            <option value="zh-TW">繁体中文</option>
+            <option value="ja">日语</option>
+            <option value="ko">韩语</option>
+            <option value="en">英语</option>
+          </select>
         </div>
       </section>
 
-      <label class="field">
-        <span>WebSocket 后端</span>
-        <input id="backendUrl" type="url" placeholder="ws://localhost:8787/realtime" />
-      </label>
-
-      <label class="field inline">
-        <input id="mockWhenBackendMissing" type="checkbox" />
-        <span>后端不可用时使用模拟字幕</span>
-      </label>
-
-      <label class="field">
-        <span>目标语言</span>
-        <select id="targetLanguage">
-          <option value="zh-CN">简体中文</option>
-          <option value="zh-TW">繁体中文</option>
-          <option value="ja">日语</option>
-          <option value="ko">韩语</option>
-          <option value="en">英语</option>
-        </select>
-      </label>
-
-      <section class="panel">
-        <div class="panel-title">
-          <h2>网页翻译</h2>
+      <section class="settings" aria-label="网页翻译">
+        <div class="setting-row">
+          <span>网页翻译</span>
+          <div class="button-pair">
+            <button id="translatePage" type="button">翻译当前页</button>
+            <button id="restorePage" type="button" class="secondary">恢复</button>
+          </div>
         </div>
-        <div class="controls">
-          <button id="translatePage" type="button">翻译当前页</button>
-          <button id="restorePage" type="button" class="secondary">恢复原文</button>
+
+        <div class="setting-row">
+          <label for="autoTranslatePages">自动翻译</label>
+          <label class="switch">
+            <input id="autoTranslatePages" type="checkbox" />
+            <span></span>
+          </label>
         </div>
-        <label class="field inline">
-          <input id="autoTranslatePages" type="checkbox" />
-          <span>自动翻译新网页</span>
-        </label>
+
+        <div class="setting-row">
+          <label for="selectionTranslation">划词翻译</label>
+          <label class="switch">
+            <input id="selectionTranslation" type="checkbox" />
+            <span></span>
+          </label>
+        </div>
       </section>
+
+      <details class="advanced">
+        <summary>模型凭证</summary>
+
+        <div id="asrCredentialHint" class="hint"></div>
+        <section id="asrFields" class="settings compact" aria-label="语音服务凭证">
+          <label class="setting-row" data-asr-field="appId">
+            <span>App ID</span>
+            <input id="asrAppId" type="text" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="accessToken">
+            <span>Access Token</span>
+            <input id="asrAccessToken" type="password" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="apiKey">
+            <span>API Key</span>
+            <input id="asrApiKey" type="password" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="apiSecret">
+            <span>API Secret</span>
+            <input id="asrApiSecret" type="password" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="secretId">
+            <span>Secret ID</span>
+            <input id="asrSecretId" type="password" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="secretKey">
+            <span>Secret Key</span>
+            <input id="asrSecretKey" type="password" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="appKey">
+            <span>App Key</span>
+            <input id="asrAppKey" type="password" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="resourceId">
+            <span>资源 ID</span>
+            <input id="asrResourceId" type="text" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="endpoint">
+            <span>接口地址</span>
+            <input id="asrEndpoint" type="url" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-asr-field="model">
+            <span>识别模型</span>
+            <input id="asrModel" type="text" list="asrModelOptions" autocomplete="off" />
+          </label>
+        </section>
+
+        <div id="translationCredentialHint" class="hint"></div>
+        <section id="translationFields" class="settings compact" aria-label="翻译服务凭证">
+          <label class="setting-row" data-translation-field="protocol">
+            <span>协议</span>
+            <select id="translationProtocol">
+              <option value="openai">OpenAI 兼容</option>
+              <option value="anthropic">Anthropic 兼容</option>
+            </select>
+          </label>
+          <label class="setting-row" data-translation-field="apiKey">
+            <span>API Key</span>
+            <input id="translationApiKey" type="password" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-translation-field="baseUrl">
+            <span>接口地址</span>
+            <input id="translationBaseUrl" type="url" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-translation-field="model">
+            <span>模型</span>
+            <input id="translationModel" type="text" list="translationModelOptions" autocomplete="off" />
+          </label>
+          <label class="setting-row" data-translation-field="disableThinking">
+            <span>思考模式</span>
+            <label class="checkbox-line">
+              <input id="translationDisableThinking" type="checkbox" />
+              <span>关闭</span>
+            </label>
+          </label>
+        </section>
+      </details>
 
       <p id="message" class="message"></p>
     </main>
+
+    <datalist id="asrModelOptions"></datalist>
+    <datalist id="translationModelOptions"></datalist>
     <script type="module" src="./popup.js"></script>
   </body>
 </html>

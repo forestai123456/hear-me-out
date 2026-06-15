@@ -15,7 +15,7 @@ This project is intentionally focused on the video subtitle path first:
 
 - Injects a subtitle overlay into every webpage.
 - Starts and stops from the extension popup.
-- Supports a WebSocket backend for streaming tab audio to realtime translation.
+- Supports a local streaming service for realtime ASR and translation.
 - Includes a local Volcengine/Doubao ASR backend plus Microsoft web translation.
 - Captures tab audio with the MV3-safe path: `tabCapture.getMediaStreamId()` in the service worker, then `getUserMedia()` inside an offscreen document.
 
@@ -38,25 +38,34 @@ The unpacked extension is generated in `dist/`.
 3. Click Load unpacked.
 4. Select this project's `dist/` directory.
 5. Open a video page and click the extension icon.
-6. Keep `WebSocket backend` set to `ws://localhost:8787/realtime`.
-7. Click `Start subtitles`.
+6. Choose the speech service and translation service in the popup.
+7. Turn on `视频实时翻译`.
 
 ## Translate A Normal Web Page
 
 The popup has two separate tools:
 
-- `Video subtitles`: captures the current tab audio and shows realtime subtitles.
-- `Page translation`: translates visible English text on the current page.
+- `视频实时翻译`: captures the current tab audio and shows realtime subtitles.
+- `网页翻译`: translates visible English text on the current page.
+- `划词翻译`: shows a small translation popover for selected text without translating the whole page.
 
 To translate a static page:
 
 1. Keep the local backend running with `npm run dev:server`.
 2. Open an English webpage.
 3. Click the extension icon.
-4. Click `Translate page`.
-5. Click `Restore` to put the original page text back.
+4. Click `翻译当前页`.
+5. Click `恢复` to put the original page text back.
 
 Page translation uses the local backend. By default it uses a balanced AI translation path when an OpenAI-compatible key is configured, and falls back to Microsoft web translation when no key is available. It skips inputs, code blocks, scripts, styles, and the extension's own subtitle overlay.
+
+To translate only one word or sentence:
+
+1. Keep `划词翻译` enabled in the popup.
+2. Select text on a normal webpage.
+3. Click the floating `翻译` button near the selection.
+
+Selection translation uses the same target language and translation service as page translation. It does not rewrite the page DOM; the result only appears in the floating popover.
 
 ## Test Real Video Audio
 
@@ -67,6 +76,18 @@ VOLCENGINE_APP_ID="your App ID"
 VOLCENGINE_ACCESS_TOKEN="your Access Token"
 VOLCENGINE_RESOURCE_ID="volc.seedasr.sauc.duration"
 VOLCENGINE_ASR_WS_URL="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+
+# Optional generic ASR fallback. The popup can also save these values locally.
+# ASR_PROVIDER="volcengine"
+# ASR_APP_ID="your App ID"
+# ASR_ACCESS_TOKEN="your Access Token"
+# ASR_API_KEY="your ASR API key"
+# ASR_API_SECRET="your ASR API secret"
+# ASR_SECRET_ID="your Tencent SecretId"
+# ASR_SECRET_KEY="your Tencent SecretKey"
+# ASR_APP_KEY="your Aliyun/Baidu AppKey"
+# ASR_WS_URL="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+# ASR_MODEL="doubao-seed-asr"
 
 # Optional. Default is Microsoft web translation with no API key.
 TRANSLATION_PROVIDER="microsoft"
@@ -83,6 +104,15 @@ PDF_TRANSLATION_PROVIDER="accurate"
 # AI_TRANSLATION_API_KEY="your API key"
 # AI_TRANSLATION_MODEL="deepseek-v4-flash"
 # AI_TRANSLATION_DISABLE_THINKING="true"
+
+# Optional long-stream stability tuning.
+# VOLCENGINE_ASR_ROTATE_MS="270000"
+# ASR_KEEPALIVE_MS="1000"
+# ASR_KEEPALIVE_IDLE_MS="1500"
+# ASR_AUDIO_BUFFER_MAX_MS="8000"
+# SUBTITLE_PENDING_FRAGMENT_LIMIT="36"
+# SUBTITLE_PROCESSED_FRAGMENT_LIMIT="50000"
+# SUBTITLE_TRANSLATION_TIMEOUT_MS="8000"
 ```
 
 Then start the local backend:
@@ -91,15 +121,50 @@ Then start the local backend:
 npm run dev:server
 ```
 
-Reload the unpacked extension from `chrome://extensions`, open a page with a playing video, and click `Start subtitles`.
+Reload the unpacked extension from `chrome://extensions`, open a page with a playing video, and turn on `视频实时翻译`.
 
 The extension captures the current tab audio and streams 16 kHz PCM16 frames to the local backend. The backend connects to Volcengine's optimized bidirectional streaming ASR endpoint, then translates recognized text to Chinese with Microsoft web translation and sends caption updates back to the page overlay.
 
+The popup no longer exposes the internal WebSocket address. The local backend still runs at `ws://localhost:8787/realtime` by default, while users configure understandable options such as `语音服务`, `翻译服务`, `目标语言`, and API credentials.
+
+Speech service presets currently include Volcengine/Doubao, Aliyun Model Studio Qwen-ASR Realtime, Tencent Cloud ASR, Baidu Realtime ASR, and iFlytek realtime transcription. Volcengine is the default path used during development. Aliyun defaults to the newer DashScope API-key flow and still keeps the older NLS AppKey + Token path as a backend compatibility fallback. The other providers follow their WebSocket handshake/signature formats in the local backend, but you still need valid credentials from the matching vendor to test them.
+
 The subtitle overlay shows frozen subtitle chunks only. Realtime ASR interim text is buffered by the backend and converted into short completed sentence or clause fragments before translation. The page overlay keeps at most two Chinese lines on screen, and video pause suspends the audio session so queued captions do not keep rolling after playback stops.
 
-## Custom AI Translation
+For long livestreams, the backend keeps the ASR session alive during speechless sections with silent audio packets, caps queued audio/subtitle buffers, times out stuck subtitle translations, and rotates the upstream Volcengine ASR connection periodically. Video pause still stops the audio session so the backend does not keep processing after playback is paused.
 
-The backend supports an OpenAI-compatible translation provider for DeepSeek and similar model vendors. Keep secrets in `.env`, not in the extension popup.
+## Translation Providers
+
+The popup supports Microsoft free translation plus OpenAI-compatible or Anthropic-compatible model providers:
+
+- DeepSeek
+- Xiaomi MiMo
+- Kimi
+- GLM / Zhipu
+- Qwen / DashScope
+- MiniMax
+- Custom compatible endpoint
+
+The popup stores API keys in Chrome local extension storage. `.env` remains supported as a backend fallback for development and command-line testing.
+
+## Preset Service References
+
+Speech recognition presets:
+
+- Volcengine/Doubao: [Streaming speech recognition model 2.0](https://www.volcengine.com/docs/6561/1354869)
+- Aliyun Model Studio: [Qwen-ASR Realtime WebSocket](https://www.alibabacloud.com/help/en/model-studio/real-time-speech-recognition-user-guide)
+- Tencent Cloud: [Realtime speech recognition WebSocket](https://cloud.tencent.com/document/product/1093/48982)
+- Baidu AI Cloud: [Realtime ASR WebSocket](https://cloud.baidu.com/doc/SPEECH/s/jlbxejt2i)
+- iFlytek: [Realtime transcription API](https://www.xfyun.cn/doc/asr/rtasr/API.html)
+
+Translation model presets:
+
+- DeepSeek: [API documentation](https://api-docs.deepseek.com/)
+- Xiaomi MiMo: [Models provider documentation](https://mimo.xiaomi.com/mimocode/models-provider)
+- Kimi: [Kimi API documentation](https://platform.kimi.com/docs/guide/start-using-kimi-api)
+- GLM / Zhipu: [Model pricing and model list](https://open.bigmodel.cn/pricing)
+- Qwen / DashScope: [OpenAI-compatible mode](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)
+- MiniMax: [OpenAI-compatible API](https://platform.minimaxi.com/docs/api-reference/text-openai-api)
 
 Example:
 
@@ -111,7 +176,7 @@ AI_TRANSLATION_MODEL=deepseek-v4-flash
 AI_TRANSLATION_DISABLE_THINKING=true
 ```
 
-`TRANSLATION_PROVIDER` controls realtime video subtitle translation. `PAGE_TRANSLATION_PROVIDER` controls static webpages. `PDF_TRANSLATION_PROVIDER` controls PDFs.
+`TRANSLATION_PROVIDER` controls fallback realtime video subtitle translation. `PAGE_TRANSLATION_PROVIDER` controls fallback static webpages. `PDF_TRANSLATION_PROVIDER` controls fallback PDFs. Settings saved in the popup take priority for extension-triggered requests.
 
 Recommended setup:
 
@@ -123,26 +188,32 @@ PDF_TRANSLATION_PROVIDER=accurate
 
 `balanced` uses AI for webpage batches when an API key is present, with Microsoft fallback. `accurate` translates PDF/document paragraphs with nearby context, which is slower but more precise. If no AI key is configured, the backend falls back to Microsoft translation.
 
-## Mock Mode
-
-Mock mode is only a UI/demo path. It does not listen to video audio.
-
-To run mock captions intentionally:
-
-1. Clear the `WebSocket backend` field.
-2. Enable `Use mock captions when backend is empty`.
-3. Click `Start subtitles`.
-
 ## Backend Protocol
 
-When `WebSocket backend` is configured, the extension sends:
+When video subtitles start, the extension sends:
 
 ```json
 {
   "type": "session.start",
   "targetLanguage": "zh-CN",
   "sampleRate": 16000,
-  "format": "pcm16"
+  "format": "pcm16",
+  "asr": {
+    "provider": "volcengine",
+    "appId": "...",
+    "accessToken": "...",
+    "resourceId": "volc.seedasr.sauc.duration",
+    "endpoint": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
+    "model": "doubao-seed-asr"
+  },
+  "translation": {
+    "provider": "microsoft",
+    "protocol": "openai",
+    "apiKey": "",
+    "baseUrl": "",
+    "model": "",
+    "disableThinking": true
+  }
 }
 ```
 
@@ -166,12 +237,12 @@ The UI ignores interim updates. Send display-ready `isFinal: true` fragments to 
 
 - `src/manifest.json`: Chrome MV3 extension manifest.
 - `src/background.ts`: popup commands, settings, offscreen lifecycle, `tabCapture.getMediaStreamId()`.
-- `src/offscreen/`: tab audio capture, AudioWorklet, WebSocket streaming, mock caption mode.
+- `src/offscreen/`: tab audio capture, AudioWorklet, local backend streaming, demo caption mode.
 - `src/content/`: subtitle overlay, page translation, video pause/resume handling.
 - `src/popup/`: extension popup controls.
 - `src/pdf/`: PDF translation result page.
 - `scripts/build.mjs`: esbuild-based extension bundler.
-- `scripts/realtime-translation-server.mjs`: local Volcengine/Doubao ASR and translation backend.
+- `scripts/realtime-translation-server.mjs`: local multi-provider ASR and translation backend.
 - `test-fixtures/`: local manual test page and media fixtures.
 
 ## License
