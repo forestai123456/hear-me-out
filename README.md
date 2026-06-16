@@ -22,7 +22,7 @@ Chrome / Edge 浏览器扩展 — 为网页视频生成实时 AI 字幕，支持
 1. 克隆仓库
 
 ```bash
-git clone https://github.com/forestai123456/听我解释.git
+git clone https://github.com/forestai123456/hear-me-out.git
 cd 听我解释
 ```
 
