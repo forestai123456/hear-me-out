@@ -265,22 +265,67 @@ function getMediaStreamId(tabId: number): Promise<string> {
   });
 }
 
-async function translateBatch(texts: string[], targetLanguage: string, settings: TranslatorSettings): Promise<string[]> {
-  const endpoint = toTranslateEndpoint(settings.backendUrl || DEFAULT_SETTINGS.backendUrl);
-  const translation = settings.translation;
-  const body: Record<string, unknown> = { texts, targetLanguage };
-  if (translation?.provider) {
-    body.translation = translation;
-  }
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+// ---- Built-in Microsoft free translation (no API key needed) ----
+let microsoftToken: string | null = null;
+let microsoftTokenExpiresAt = 0;
 
-  if (!response.ok) throw new Error(await readBackendError(response, `网页翻译后端请求失败：${response.status}`));
-  const result = (await response.json()) as { translations?: string[] };
-  return result.translations ?? texts.map(() => "");
+async function getMicrosoftToken(): Promise<string> {
+  if (microsoftToken && Date.now() < microsoftTokenExpiresAt) return microsoftToken;
+  const response = await fetch("https://edge.microsoft.com/translate/auth");
+  if (!response.ok) throw new Error(`Microsoft translate auth failed: ${response.status}`);
+  microsoftToken = await response.text();
+  microsoftTokenExpiresAt = Date.now() + 8 * 60 * 1000;
+  return microsoftToken;
+}
+
+async function translateWithMicrosoft(texts: string[], targetLanguage: string): Promise<string[]> {
+  if (texts.length === 0) return [];
+  const token = await getMicrosoftToken();
+  const response = await fetch(
+    `https://api-edge.cognitive.microsofttranslator.com/translate?from=&to=${encodeURIComponent(targetLanguage)}&api-version=3.0&includeSentenceLength=true&textType=plain`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(texts.map((text) => ({ Text: text }))),
+    },
+  );
+  if (!response.ok) throw new Error(`Microsoft translation failed: ${response.status}`);
+  const result = await response.json();
+  return texts.map((_, i) => result?.[i]?.translations?.[0]?.text ?? "");
+}
+
+/**
+ * Translate a batch of texts. Uses built-in Microsoft translation by default.
+ * Falls back to the local backend only when an AI provider with a key is configured.
+ */
+async function translateBatch(texts: string[], targetLanguage: string, settings: TranslatorSettings): Promise<string[]> {
+  const translation = settings.translation;
+  const hasAiKey = translation?.apiKey?.trim() && translation?.provider && translation.provider !== "microsoft";
+
+  // No AI key → use built-in Microsoft translation (works out of the box)
+  if (!hasAiKey) {
+    return translateWithMicrosoft(texts, targetLanguage);
+  }
+
+  // AI key configured → try local backend first, fall back to Microsoft
+  try {
+    const endpoint = toTranslateEndpoint(settings.backendUrl || DEFAULT_SETTINGS.backendUrl);
+    const body: Record<string, unknown> = { texts, targetLanguage, translation };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(await readBackendError(response, `后端请求失败：${response.status}`));
+    const result = (await response.json()) as { translations?: string[] };
+    return result.translations ?? texts.map(() => "");
+  } catch {
+    // Backend unavailable → fall back to Microsoft
+    return translateWithMicrosoft(texts, targetLanguage);
+  }
 }
 
 interface PdfTranslationResult {
